@@ -350,6 +350,28 @@ class MainWindow(QMainWindow):
 
         self.standard_table = self._make_catalog_table()
         self.error_term_table = self._make_catalog_table()
+
+        self.standard_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.standard_table.customContextMenuRequested.connect(
+            lambda pos: self._show_series_context_menu(
+                self.standard_table,
+                "standard",
+                pos,
+            )
+        )
+
+        self.error_term_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.error_term_table.customContextMenuRequested.connect(
+            lambda pos: self._show_series_context_menu(
+                self.error_term_table,
+                "error_term",
+                pos,
+            )
+        )
         self.item_table = QTableWidget(0, 2)
         self.item_table.setHorizontalHeaderLabels(["Item", "值"])
         self.item_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -698,6 +720,44 @@ class MainWindow(QMainWindow):
 
             for c, value in enumerate(vals):
                 table.setItem(r, c, QTableWidgetItem(value))
+
+    def _show_series_context_menu(
+        self,
+        table: QTableWidget,
+        kind: str,
+        pos,
+    ):
+        item = table.itemAt(pos)
+        if item is None:
+            return
+
+        row = item.row()
+        name_item = table.item(row, 0)
+        if name_item is None:
+            return
+
+        menu = QMenu(self)
+        copy_current_action = menu.addAction("复制当前名称")
+        copy_all_action = menu.addAction("复制全部名称")
+
+        action = menu.exec(table.viewport().mapToGlobal(pos))
+
+        if action == copy_current_action:
+            text = name_item.text()
+            QApplication.clipboard().setText(text)
+            self.log(f"已复制名称：{text}")
+        elif action == copy_all_action:
+            names = []
+            for r in range(table.rowCount()):
+                cell = table.item(r, 0)
+                if cell is not None and cell.text():
+                    names.append(cell.text())
+
+            text = "\n".join(names)
+            QApplication.clipboard().setText(text)
+
+            label = "Standard" if kind == "standard" else "Error Term"
+            self.log(f"已复制全部 {label} 名称，共 {len(names)} 项")
 
     def _fill_items(self, items: dict):
         self.item_table.setRowCount(len(items))
