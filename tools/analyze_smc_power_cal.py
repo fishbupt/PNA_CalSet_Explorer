@@ -254,6 +254,161 @@ def analyze_receiver_tracking(receiver: Series, tracking: Series, label: str) ->
     return lines
 
 
+def linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 2 or np.std(x) == 0:
+        return float("nan"), float("nan"), float("nan")
+    slope, intercept = np.polyfit(x, y, 1)
+    pred = slope * x + intercept
+    ss_res = np.sum((y - pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return float(slope), float(intercept), float(r2)
+
+
+def rmse(x: np.ndarray) -> float:
+    x = np.asarray(x)
+    mask = np.isfinite(x)
+    x = x[mask]
+    if x.size == 0:
+        return float("nan")
+    return float(np.sqrt(np.mean(np.abs(x) ** 2)))
+
+
+def analyze_source_correction_structure(pm: Series, corr: Series, label: str) -> list[str]:
+    f, zpm, zc, how = align(pm, corr)
+    lines = [f"\n=== {label}：结构判别 ===", f"对齐方式: {how}"]
+    if f.size < 3:
+        lines.append("有效点太少，无法分析。")
+        return lines
+
+    p = zpm.real
+    c = zc.real
+    p0 = p - np.mean(p)
+    c0 = c - np.mean(c)
+
+    slope, intercept, r2 = linear_fit(p, c)
+    lines.append(f"线性拟合 C = a*P+b: a={slope:.9g}, b={intercept:.9g}, R²={r2:.9g}")
+
+    residual_half = c0 + 0.5 * p0
+    lines.append(f"假设 C变化量 ≈ -0.5*P变化量: residual std={np.std(residual_half):.9g}")
+
+    # Test whether C is approximately the negative 2-point moving average of power error.
+    prev_avg = 0.5 * (p0[1:] + p0[:-1])
+    c_prev = c0[1:]
+    s1, b1, r21 = linear_fit(prev_avg, c_prev)
+    lines.append(
+        f"两点平均(当前+前一点): C vs avg(P): slope={s1:.9g}, R²={r21:.9g}, "
+        f"corr={corrcoef_safe(c_prev, -prev_avg):.9g}"
+    )
+
+    next_avg = 0.5 * (p0[:-1] + p0[1:])
+    c_next = c0[:-1]
+    s2, b2, r22 = linear_fit(next_avg, c_next)
+    lines.append(
+        f"两点平均(当前+后一点): C vs avg(P): slope={s2:.9g}, R²={r22:.9g}, "
+        f"corr={corrcoef_safe(c_next, -next_avg):.9g}"
+    )
+
+    # Lag correlations help identify whether the correction is delayed/smoothed.
+    lag_parts = []
+    for lag in range(-3, 4):
+        if lag < 0:
+            pp = p0[-lag:]
+            cc = c0[:len(c0)+lag]
+        elif lag > 0:
+            pp = p0[:-lag]
+            cc = c0[lag:]
+        else:
+            pp = p0
+            cc = c0
+        lag_parts.append(f"lag{lag:+d}:{corrcoef_safe(cc, -pp):.4f}")
+    lines.append("corr(C, -P shifted): " + ", ".join(lag_parts))
+    return lines
+
+
+def analyze_tracking_formula(
+    pm: Series,
+    receiver: Series,
+    tracking: Series,
+    label: str,
+) -> list[str]:
+    f1, zpm, zr, how1 = align(pm, receiver)
+    if f1.size == 0:
+        return [f"\n=== {label} ===", f"无法对齐 PowerMeter 与 Receiver: {how1}"]
+
+    # Build temporary series on the common PM/receiver axis, then align to tracking.
+    pm_aligned = Series("pm", f1, zpm)
+    rr_aligned = Series("receiver", f1, zr)
+    f2, zrr, ztr, how2 = align(rr_aligned, tracking)
+    if f2.size == 0:
+        return [f"\n=== {label} ===", f"无法对齐 Receiver 与 Tracking: {how2}"]
+
+    # Align power meter again to final frequency axis.
+    _, zpm2, _, _ = align(pm_aligned, Series("final", f2, ztr))
+    p_dbm = zpm2.real
+
+    power_amp = 10.0 ** (p_dbm / 20.0)
+    predicted = zrr / power_amp
+    diff = ztr - predicted
+
+    mask = np.abs(predicted) > 1e-300
+    rel = np.full(predicted.shape, np.nan + 1j * np.nan, dtype=np.complex128)
+    rel[mask] = ztr[mask] / predicted[mask]
+    valid = finite_complex(rel)
+
+    lines = [f"\n=== {label}：公式验证 ==="]
+    lines.append("候选公式: Tracking = ReceiverReading / 10^(PowerMeter_dBm/20)")
+    lines.append(f"绝对误差 |actual-predicted|: {scalar_stats(np.abs(diff))}")
+    lines.append(f"complex RMSE: {rmse(diff):.9g}")
+    if valid.size:
+        lines.append(f"|actual/predicted|: {scalar_stats(np.abs(valid))}")
+        lines.append(f"phase(actual/predicted): {scalar_stats(np.angle(valid, deg=True))} deg")
+    return lines
+
+
+def analyze_exact_alias(a: Series, b: Series, label: str) -> list[str]:
+    f, za, zb, how = align(a, b)
+    lines = [f"\n=== {label}：是否同一数据 ===", f"对齐方式: {how}"]
+    if f.size == 0:
+        lines.append("无法比较。")
+        return lines
+    d = za - zb
+    lines.append(f"max|A-B| = {np.max(np.abs(d)):.12g}")
+    lines.append(f"RMSE(A-B) = {rmse(d):.12g}")
+    lines.append(f"array_equal = {np.array_equal(za, zb)}")
+    return lines
+
+
+def analyze_total_source_correction(raw: Series, total: Series, label: str) -> list[str]:
+    f, zr, zt, how = align(raw, total)
+    lines = [f"\n=== {label}：Total 数据形态 ===", f"对齐方式: {how}"]
+    if f.size == 0:
+        lines.append("无法比较。")
+        return lines
+    eps = 1e-300
+    mag = np.abs(zt)
+    db20 = 20 * np.log10(np.maximum(mag, eps))
+    db10 = 10 * np.log10(np.maximum(mag, eps))
+    phase = np.angle(zt, deg=True)
+    lines.append(f"Total Real: {scalar_stats(zt.real)}")
+    lines.append(f"Total Imag: {scalar_stats(zt.imag)}")
+    lines.append(f"Total |Z|:  {scalar_stats(mag)}")
+    lines.append(f"20log10|Total|: {scalar_stats(db20)} dB")
+    lines.append(f"10log10|Total|: {scalar_stats(db10)} dB")
+    lines.append(f"phase(Total): {scalar_stats(phase)} deg")
+    lines.append(f"corr(Raw.real, 20log|Total|) = {corrcoef_safe(zr.real, db20):.9g}")
+    lines.append(f"corr(Raw.real, 10log|Total|) = {corrcoef_safe(zr.real, db10):.9g}")
+    lines.append(
+        "若 Total 跨几十 dB，而 Raw 只有 1e-4 量级，则两者显然不是同单位的可直接相减标量；"
+        "Total 更可能包含既有源平坦度/硬件链路的总修正。"
+    )
+    return lines
+
 def require(series: dict[str, Series], name: str) -> Series | None:
     return series.get(name)
 
@@ -356,6 +511,48 @@ def main() -> int:
             lines.append(f"跳过：缺少 {a_name if a is None else b_name}")
             continue
         add_if(lines, func(a, b, label))
+
+    # Second-stage formula diagnostics.
+    diagnostics = [
+        ("Power Meter Input vs RawSourcePowerCorrection(1)", "Power Meter Readings_Input(1)", "RawSourcePowerCorrection(1)"),
+        ("Power Meter Output vs RawSourcePowerCorrection(2)", "Power Meter Readings_Output(1)", "RawSourcePowerCorrection(2)"),
+    ]
+    for label, pm_name, corr_name in diagnostics:
+        pm = require(series, pm_name)
+        corr = require(series, corr_name)
+        if pm is not None and corr is not None:
+            add_if(lines, analyze_source_correction_structure(pm, corr, label))
+
+    tracking_sets = [
+        ("R1 Tracking", "Power Meter Readings_Input(1)", "ReceiverReading(R1)", "RawResponseTracking(R1)"),
+        ("R2 Tracking", "Power Meter Readings_Output(1)", "ReceiverReading(R2)", "RawResponseTracking(R2)"),
+    ]
+    for label, pm_name, rr_name, tr_name in tracking_sets:
+        pm = require(series, pm_name)
+        rr = require(series, rr_name)
+        tr = require(series, tr_name)
+        if pm is not None and rr is not None and tr is not None:
+            add_if(lines, analyze_tracking_formula(pm, rr, tr, label))
+
+    alias_sets = [
+        ("Input Match alias", "Power Sensor Match_Input(1)", "RawPowerSensorMatch(1)"),
+        ("Output Match alias", "Power Sensor Match_Output(1)", "RawPowerSensorMatch(2)"),
+    ]
+    for label, a_name, b_name in alias_sets:
+        a = require(series, a_name)
+        b = require(series, b_name)
+        if a is not None and b is not None:
+            add_if(lines, analyze_exact_alias(a, b, label))
+
+    total_sets = [
+        ("Port 1 Source Power Correction", "RawSourcePowerCorrection(1)", "TotalSourcePowerCorrection(1)"),
+        ("Port 2 Source Power Correction", "RawSourcePowerCorrection(2)", "TotalSourcePowerCorrection(2)"),
+    ]
+    for label, raw_name, total_name in total_sets:
+        raw = require(series, raw_name)
+        total = require(series, total_name)
+        if raw is not None and total is not None:
+            add_if(lines, analyze_total_source_correction(raw, total, label))
 
     # Cross-check logical Input/Output sensor match versus physical-port sensor match.
     cross_pairs = [
