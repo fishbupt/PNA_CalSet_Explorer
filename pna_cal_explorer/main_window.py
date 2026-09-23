@@ -9,10 +9,11 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QThreadPool
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton,
-    QProgressBar, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
-    QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu,
+    QMessageBox, QPushButton, QProgressBar, QProgressDialog, QSplitter,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 from .models import CalSetSnapshot, ComplexSeries
@@ -251,6 +252,7 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self._busy = False
         self._current_series: ComplexSeries | None = None
+        self._loading_dialog: QProgressDialog | None = None
 
         self._build_ui()
         self._configure_plot()
@@ -325,6 +327,10 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self._section_title("CalSet"))
         self.calset_list = QListWidget()
         self.calset_list.currentTextChanged.connect(self.load_selected_calset)
+        self.calset_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.calset_list.customContextMenuRequested.connect(
+            self._show_calset_context_menu
+        )
         side_layout.addWidget(self.calset_list, 1)
         main_split.addWidget(side_card)
 
@@ -338,16 +344,6 @@ class MainWindow(QMainWindow):
         upper_layout = QVBoxLayout(upper)
         upper_layout.setContentsMargins(0, 0, 0, 0)
         upper_layout.setSpacing(8)
-
-        upper_layout.addWidget(self._section_title("CalSet 信息"))
-        self.info_table = QTableWidget(0, 2)
-        self.info_table.setHorizontalHeaderLabels(["字段", "值"])
-        self.info_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.info_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.info_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.info_table.setAlternatingRowColors(True)
-        self.info_table.setMaximumHeight(220)
-        upper_layout.addWidget(self.info_table)
 
         self.tabs = QTabWidget()
         upper_layout.addWidget(self.tabs, 1)
@@ -483,7 +479,7 @@ class MainWindow(QMainWindow):
             self.client.disconnect()
             self.reader = None
             self.calset_list.clear()
-            self.current_snapshot = None
+            self._clear_calset_content()
             self.idn_label.setText("仪表：—")
             self._set_connected(False)
             self.log("已断开连接。")
@@ -542,24 +538,29 @@ class MainWindow(QMainWindow):
             return
 
         self._set_busy(True)
+        self._clear_calset_content()
         self.progress.setValue(0)
         self.log(f"正在读取 CalSet：{name}")
+        self._show_loading_dialog(name)
 
         worker = FunctionWorker(self.reader.read_snapshot, name, True)
         worker.signals.progress.connect(self._on_progress)
         worker.signals.result.connect(self._show_snapshot)
-        worker.signals.error.connect(self._on_worker_error)
-        worker.signals.finished.connect(lambda: self._set_busy(False))
+        worker.signals.error.connect(self._on_calset_load_error)
+        worker.signals.finished.connect(self._finish_calset_load)
         self.thread_pool.start(worker)
 
     def _on_progress(self, text: str, current: int, total: int):
         self.log(text)
-        self.progress.setValue(int(current * 100 / total) if total else 0)
+        value = int(current * 100 / total) if total else 0
+        self.progress.setValue(value)
+        if self._loading_dialog is not None:
+            self._loading_dialog.setLabelText(text)
+            self._loading_dialog.setValue(value)
 
     def _show_snapshot(self, snapshot: CalSetSnapshot):
         self.current_snapshot = snapshot
         self.progress.setValue(100)
-        self._fill_info(snapshot)
         self._fill_series_catalog(self.standard_table, snapshot.standards)
         self._fill_series_catalog(self.error_term_table, snapshot.error_terms)
         self._fill_items(snapshot.items)
@@ -575,21 +576,113 @@ class MainWindow(QMainWindow):
         elif snapshot.error_terms:
             self.show_series("error_term", 0)
 
-    def _fill_info(self, snapshot: CalSetSnapshot):
+    def _clear_calset_content(self):
+        """切换 CalSet 时立即清空旧内容，避免误以为旧数据属于新 CalSet。"""
+        self.current_snapshot = None
+        self._current_series = None
+
+        self.standard_table.setRowCount(0)
+        self.error_term_table.setRowCount(0)
+        self.item_table.setRowCount(0)
+        self.data_table.setRowCount(0)
+        self.plot.clear()
+
+    def _show_loading_dialog(self, calset_name: str):
+        dialog = QProgressDialog(
+            f"正在从 PNA 读取 CalSet：{calset_name}\n请稍候…",
+            "",
+            0,
+            100,
+            self,
+        )
+        dialog.setWindowTitle("正在更新数据")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.setMinimumWidth(430)
+        dialog.show()
+        self._loading_dialog = dialog
+
+    def _finish_calset_load(self):
+        if self._loading_dialog is not None:
+            self._loading_dialog.close()
+            self._loading_dialog.deleteLater()
+            self._loading_dialog = None
+        self._set_busy(False)
+
+    def _on_calset_load_error(self, text: str):
+        self._clear_calset_content()
+        self._on_worker_error(text)
+
+    def _show_calset_context_menu(self, pos):
+        item = self.calset_list.itemAt(pos)
+        if item is None:
+            return
+
+        menu = QMenu(self)
+        info_action = menu.addAction("查看 CalSet 信息")
+        action = menu.exec(self.calset_list.viewport().mapToGlobal(pos))
+
+        if action == info_action:
+            self._show_calset_info_dialog(item.text())
+
+    def _show_calset_info_dialog(self, calset_name: str):
+        snapshot = self.current_snapshot
+        if snapshot is None or snapshot.name != calset_name:
+            QMessageBox.information(
+                self,
+                "CalSet 信息",
+                "请先左键选择该 CalSet，等待读取完成后再查看详细信息。",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"CalSet 信息 - {calset_name}")
+        dialog.resize(760, 620)
+
+        layout = QVBoxLayout(dialog)
+        title = QLabel(calset_name)
+        title.setObjectName("Title")
+        layout.addWidget(title)
+
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["字段", "值"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+
         rows = [("CalSet", snapshot.name)]
+        for key, value in snapshot.info.items():
+            if key != "name":
+                rows.append((key, value))
+        for key, value in snapshot.properties.items():
+            rows.append((key, value))
+        for key, value in snapshot.items.items():
+            rows.append((f"ITEM / {key}", value))
 
-        for k, v in snapshot.info.items():
-            if k not in ("standard_names", "error_term_names", "name"):
-                rows.append((k, v))
+        table.setRowCount(len(rows))
+        for row, (key, value) in enumerate(rows):
+            table.setItem(row, 0, QTableWidgetItem(str(key)))
+            table.setItem(row, 1, QTableWidgetItem("" if value is None else str(value)))
 
-        for k, v in snapshot.properties.items():
-            if not k.endswith("_raw") and not isinstance(v, list):
-                rows.append((k, v))
+        layout.addWidget(table, 1)
 
-        self.info_table.setRowCount(len(rows))
-        for r, (k, v) in enumerate(rows):
-            self.info_table.setItem(r, 0, QTableWidgetItem(str(k)))
-            self.info_table.setItem(r, 1, QTableWidgetItem("" if v is None else str(v)))
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dialog.accept)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        dialog.exec()
 
     @staticmethod
     def _fill_series_catalog(table: QTableWidget, series: list[ComplexSeries]):
